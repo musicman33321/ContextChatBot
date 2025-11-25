@@ -1,36 +1,40 @@
+# src/contextchatbot/chatbot2.py
+
 import pandas as pd
 import tiktoken
 import openai
 import os
-from dotenv import load_dotenv 
+from typing import Tuple
 
-max_token_count = 4097
-max_response_length = 150
-
-COMPLETION_MODEL_NAME = "gpt-3.5-turbo-instruct"
-
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-#Load CSV data
-df = pd.read_csv('data/2023_fashion_trends.csv')
-
-#Extract text data columnn
-df_cleaned = df["Trends"]
-
-print(df.head())
-
-
-def create_prompt(question, df, max_token_count):
+class ContextualChatbot:
     """
-    Given a question and a dataframe containing rows of text and their
-    embeddings, return a text prompt to send to a Completion model
+    A contextual chatbot agent that uses a local CSV for Retrieval-Augmented Generation (RAG).
     """
-    # Create a tokenizer that is designed to align with our embeddings
-    tokenizer = tiktoken.get_encoding("cl100k_base")
+    
+    # Constants should be class or instance attributes, not global variables
+    MAX_TOKEN_COUNT = 4097
+    MAX_RESPONSE_LENGTH = 150
+    COMPLETION_MODEL_NAME = "gpt-3.5-turbo-instruct"
 
-    # Count the number of tokens in the prompt template and question
-    prompt_template = """
+    def __init__(self, data_path: str = 'data/2023_fashion_trends.csv'):
+        
+        # API Key is loaded via os.getenv in the main CLI, but we ensure it's set
+        if not os.getenv("OPENAI_API_KEY"):
+            raise ValueError("OPENAI_API_KEY environment variable not found. Check your .env file.")
+            
+        openai.api_key = os.getenv("OPENAI_API_KEY")
+
+        # Load CSV data from the expected relative path
+        try:
+            df = pd.read_csv(data_path)
+            self.context_data = df["Trends"].values
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Data file not found at: {data_path}")
+
+        self.tokenizer = tiktoken.get_encoding("cl100k_base")
+        
+        # The prompt template is also stored as an attribute
+        self.prompt_template = """
 Answer the question based on the context below, and if the question
 can't be answered based on the context, say "I don't know"
 
@@ -43,69 +47,56 @@ Context:
 Question: {}
 Answer:"""
 
-    current_token_count = len(tokenizer.encode(prompt_template)) + \
-                            len(tokenizer.encode(question))
 
-    context = []
-    #for text in get_rows_sorted_by_relevance(question, df)["text"].values:
-    for text in df:
+    def _create_prompt(self, question: str) -> Tuple[int, str]:
+        """Creates the prompt by filling the context until max token count is reached."""
+        
+        current_token_count = len(self.tokenizer.encode(self.prompt_template)) + \
+                                len(self.tokenizer.encode(question))
+        
+        context = []
+        # Calculate the maximum tokens allowed for context
+        max_prompt_tokens = self.MAX_TOKEN_COUNT - self.MAX_RESPONSE_LENGTH
 
-        # Increase the counter based on the number of tokens in this row
-        text_token_count = len(tokenizer.encode(text))
-        current_token_count += text_token_count
+        for text in self.context_data:
 
-        # Add the row of text to the list if we haven't exceeded the max
-        if current_token_count <= max_token_count:
-            context.append(text)
-        else:
-            break
+            text_token_count = len(self.tokenizer.encode(text))
+            
+            # Add the row of text to the list if we haven't exceeded the max
+            if current_token_count + text_token_count <= max_prompt_tokens:
+                context.append(text)
+                current_token_count += text_token_count
+            else:
+                break
+        
+        return current_token_count, self.prompt_template.format("\n\n###\n\n".join(context), question)
 
-    return current_token_count, prompt_template.format("\n\n###\n\n".join(context), question)
 
-def answer_question(
-    question, df, max_prompt_tokens=1800, max_answer_tokens=150
-):
-    """
-    Given a question, a dataframe containing rows of text, and a maximum
-    number of desired tokens in the prompt and response, return the
-    answer to the question according to an OpenAI Completion model
+    def answer_question(self, question: str) -> Tuple[int,str, str, str]:
+        """
+        Queries the OpenAI API with a context-augmented prompt.
+        Returns: (tokens used, answer text, full prompt sent)
+        """
+        
+        num_tokens, prompt = self._create_prompt(question)
 
-    If the model produces an error, return an empty string
-    """
+        try:
+            #Add context from dataset
+            response_without_context = openai.Completion.create(
+                model=self.COMPLETION_MODEL_NAME,
+                prompt=question,
+                max_tokens=self.MAX_RESPONSE_LENGTH
+            )
 
-    [num_tokens, prompt] = create_prompt(question, df, max_prompt_tokens - max_answer_tokens)
+            #Add context from dataset
+            response_with_context = openai.Completion.create(
+                model=self.COMPLETION_MODEL_NAME,
+                prompt=prompt,
+                max_tokens=self.MAX_RESPONSE_LENGTH
+            )
 
-    try:
-        response = openai.Completion.create(
-            model=COMPLETION_MODEL_NAME,
-            prompt=prompt,
-            max_tokens=max_answer_tokens
-        )
-        return num_tokens, response["choices"][0]["text"].strip()
-    except Exception as e:
-        print(e)
-        return ""
-
-#ChatGPT without provided fasion 2023 context:
-question1 = "It's 2023, is a Canadian tuxedo in or out?"
-
-#Obtain original result without context
-response = openai.Completion.create(
-    model=COMPLETION_MODEL_NAME,
-    prompt=question1,
-    max_tokens=max_response_length
-)
-
-#Add context from dataset
-_ , prompt_with_context= create_prompt(question1, df_cleaned, max_token_count- max_response_length)
-
-#Obtain result with context
-response_with_context = openai.Completion.create(
-    model=COMPLETION_MODEL_NAME,
-    prompt=prompt_with_context,
-    max_tokens=max_response_length
-)
-
-print("Question:\n" + question1 + "\n")
-print("Answer Without Context:\n" + response["choices"][0]["text"].strip() + "\n")
-print("Answer With Fashion Trends Context:\n" + response_with_context["choices"][0]["text"].strip())
+            return  num_tokens, question, response_without_context["choices"][0]["text"].strip(), response_with_context["choices"][0]["text"].strip()
+        except Exception as e:
+            # You should use a logger, but print is fine for this example
+            print(f"OpenAI API Error: {e}") 
+            return 0, "I apologize, an error occurred during the API call.", ""
